@@ -1,0 +1,42 @@
+I am writing a Python autocorrect script for school, coding, and everyday typing.
+This program should correct common spelling mistakes without changing valid words.
+It should leave allowed, allows, allowing, and allowed alone when they are correct.
+It should leave word, words, wording, and worded alone when they are correct.
+It should leave script, scripts, scripting, and scripted alone when they are correct.
+It should leave class, classes, function, functions, variable, variables, object, objects, string, strings, and parameter, parameters alone when they are correct.
+
+I write code in Python, JavaScript, and sometimes shell scripts.
+I build programs, functions, classes, modules, libraries, interfaces, systems, tools, utilities, scripts, and applications.
+I debug programs, test functions, fix errors, review code, and improve performance.
+I work with variables, parameters, methods, objects, dictionaries, lists, tuples, sets, loops, conditions, files, folders, and packages.
+I use programming terms such as algorithm, algorithms, database, databases, language, languages, framework, frameworks, implementation, implementations, development, developer, developers, application, applications, technology, technologies, environment, environments, system, systems, interface, interfaces, solution, solutions, structure, structures, and information.
+
+I study mathematics, biology, chemistry, physics, statistics, psychology, and computer science.
+I write essays, reports, assignments, explanations, and responses for school.
+I study calculus, derivatives, integrals, limits, algebra, trigonometry, probability, distributions, variables, equations, functions, graphs, vectors, matrices, and data.
+I write about experiments, hypotheses, analyses, conclusions, observations, measurements, results, and interpretations.
+I use words such as necessary, separate, receive, believe, achieve, definitely, beginning, occurrence, recommend, accommodate, relevant, calendar, colleague, environment, experience, government, business, and grammar.
+
+I also write messages, chats, emails, comments, notes, reminders, and quick responses.
+I type phrases like I am, I will, I have, I would, I do not, does not, did not, cannot, should not, would not, could not, you are, you have, you will, we are, we have, they are, and that is.
+I write contractions such as I'm, I've, I'll, I'd, don't, doesn't, didn't, can't, won't, shouldn't, wouldn't, couldn't, you're, you've, you'll, we're, we've, they're, that's, here's, there's, and what's.
+
+I write about projects, project files, source code, bug fixes, implementation details, development work, and software design.
+I write about coding problems, technical questions, system behavior, command line usage, installation steps, package management, configuration settings, version control, testing workflows, and debugging strategies.
+I write about command, commands, terminal, shell, Linux, Windows, macOS, keyboard, listener, controller, daemon, buffer, boundary, punctuation, threads, locking, state, toggle, and permissions.
+
+I also write about games, fitness, studying, and daily life.
+I write about chess, Valorant, cycling, gym workouts, classes, homework, teachers, students, tests, grades, and schedules.
+I write about energy, focus, progress, training, strength, performance, nutrition, hydration, and recovery.
+
+This corpus is intended to make common everyday words more probable than unusual words.
+This corpus should help the spell corrector prefer allowed over allow when allowed is the intended word.
+This corpus should help the spell corrector prefer words over word when words is the intended word.
+This corpus should help the spell corrector prefer scripts over script when scripts is the intended word.
+This corpus should help the spell corrector prefer classes over class when classes is the intended word.
+This corpus should help the spell corrector prefer functions over function when functions is the intended word.
+This corpus should help the spell corrector prefer variables over variable when variables is the intended word.
+
+The spell corrector should correct common mistakes like teh to the, recieve to receive, seperate to separate, definately to definitely, and enviroment to environment.
+The spell corrector should avoid overcorrecting valid words, plurals, verb tenses, and normal technical vocabulary.
+The spell corrector should work well for coding, school writing, notes, and messages.
