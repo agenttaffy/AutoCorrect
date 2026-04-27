@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # AutoCorrect
 
 A lightweight system-wide Python autocorrect script that fixes common misspellings while you type across apps.
@@ -131,3 +132,7 @@ If the script launches but does not intercept keys, make sure Python and `pynput
 ## License
 
 MIT, if you choose to add one.
+=======
+# AutoCorrect
+Autocorrect that runs as a daemon
+>>>>>>> d39fdad (Initial commit)
