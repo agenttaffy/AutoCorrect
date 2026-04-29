@@ -9,7 +9,7 @@ def main():
     ...
 """
 ╔══════════════════════════════════════════════════════╗
-║        AutoCorrect Daemon v3.1 (Stable, No Undo)    ║
+║        AutoCorrect Daemon v4.0 (Context-Aware)       ║
 ║    System-wide spell correction across all apps     ║
 ╚══════════════════════════════════════════════════════╝
 
@@ -17,28 +17,22 @@ INSTALL:
     pip install pynput
 
 RUN:
-    python autocorrectv3.py
+    python AutoCorrect.py
 
 TOGGLE ON/OFF:  Ctrl + Shift + A
 QUIT:           Ctrl + C  (in terminal)
 
 OVERVIEW:
-- No difflib fuzzy matching
-- Uses edit-based candidate generation:
-    deletion, transposition, replacement, insertion
-- Uses word frequencies to rank corrections
-- Strong guardrails to avoid bad fixes like:
-    words   -> word
-    allowed -> allow
-    scripts -> script
+- Uses edit-based candidate generation: deletion, transposition, replacement, insertion
+- Uses word frequencies and bigram context to rank corrections
+- Retroactively fixes common confusable words (e.g., their -> they're)
+- Auto-capitalizes after sentence boundaries (.!?)
 - Explicit typo dictionary still has highest priority
-- Undo removed for stability
+- Undo via double backspace
 
 OPTIONAL:
-- Put a file named "wordlist_10k.txt" beside this script
-  with one word per line to expand the vocabulary.
-- Put a file named "corpus.txt" beside this script
-  to improve word frequency ranking.
+- Put a file named "wordlist.txt" beside this script with one word per line to expand the vocabulary.
+- Put a file named "corpus.txt" beside this script to improve word frequency and bigram ranking.
 """
 
 import sys
@@ -46,7 +40,9 @@ import time
 import threading
 import os
 import re
-from collections import Counter
+import json
+import datetime
+from collections import Counter, deque
 
 try:
     from pynput.keyboard import Key, Controller, Listener
@@ -55,6 +51,119 @@ except ImportError:
     print("Run:  pip install pynput\n")
     sys.exit(1)
 
+# ─────────────────────────────────────────────────────
+# GUI HOOKS & STATS
+# ─────────────────────────────────────────────────────
+GUI_WORDS_SCANNED = 0
+GUI_UNKNOWN_TOKENS = 0
+GUI_CORRECTIONS_APPLIED = 0
+GUI_TOTAL_PROCESSING_TIME = 0.0
+
+ENABLE_BIGRAMS = True
+ENABLE_CAPITALIZATION = True
+UNDO_WINDOW = 0.15
+MASTER_ENABLE = True
+
+# Persistence Files
+STATS_FILE = "stats.json"
+CUSTOM_DICT_FILE = "custom_dict.txt"
+UNKNOWN_FILE = "unknown.txt"
+
+def load_stats():
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_stats(stats):
+    with open(STATS_FILE, "w") as f:
+        json.dump(stats, f)
+
+def record_daily_stat(stat_key, val=1):
+    stats = load_stats()
+    today = datetime.date.today().isoformat()
+    if today not in stats:
+        stats[today] = {"scanned": 0, "corrected": 0, "unknown": 0, "time_ms": 0.0}
+    stats[today][stat_key] += val
+    save_stats(stats)
+
+def log_unknown(word):
+    if not os.path.exists(UNKNOWN_FILE):
+        open(UNKNOWN_FILE, "w").close()
+    with open(UNKNOWN_FILE, "a") as f:
+        f.write(word + "\n")
+
+def load_custom_dict():
+    if os.path.exists(CUSTOM_DICT_FILE):
+        with open(CUSTOM_DICT_FILE, "r") as f:
+            for line in f:
+                w = line.strip().lower()
+                if w:
+                    TRUSTED_WORDS.add(w)
+                    WORDS[w] += 1000  # High frequency to ensure it gets picked
+
+def add_custom_word(word):
+    w = word.strip().lower()
+    if not w: return False
+    
+    # Add to memory
+    TRUSTED_WORDS.add(w)
+    WORDS[w] += 1000
+    
+    # Save to file
+    custom_words = set()
+    if os.path.exists(CUSTOM_DICT_FILE):
+        with open(CUSTOM_DICT_FILE, "r") as f:
+            custom_words = set(f.read().splitlines())
+    custom_words.add(w)
+    with open(CUSTOM_DICT_FILE, "w") as f:
+        f.write("\n".join(sorted(custom_words)))
+    return True
+
+def remove_custom_word(word):
+    w = word.strip().lower()
+    if not w: return False
+    
+    # Remove from memory
+    if w in TRUSTED_WORDS:
+        TRUSTED_WORDS.remove(w)
+    if w in WORDS:
+        del WORDS[w]
+        
+    # Save to file
+    if os.path.exists(CUSTOM_DICT_FILE):
+        with open(CUSTOM_DICT_FILE, "r") as f:
+            custom_words = set(f.read().splitlines())
+        if w in custom_words:
+            custom_words.remove(w)
+            with open(CUSTOM_DICT_FILE, "w") as f:
+                f.write("\n".join(sorted(custom_words)))
+    return True
+
+GUI_CALLBACKS = {
+    "on_log": None,          # func(original, corrected)
+    "on_stats_update": None, # func()
+    "on_status": None,       # func(msg)
+    "on_toggle": None        # func(enabled)
+}
+
+def _notify_stats():
+    cb = GUI_CALLBACKS["on_stats_update"]
+    if cb:
+        cb()
+
+def _notify_log(orig, corr):
+    cb = GUI_CALLBACKS["on_log"]
+    if cb:
+        cb(orig, corr)
+
+def _notify_toggle(enabled):
+    cb = GUI_CALLBACKS["on_toggle"]
+    if cb:
+        cb(enabled)
 
 # ─────────────────────────────────────────────────────
 # EXPLICIT TYPO FIXES
@@ -201,8 +310,6 @@ ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 # ─────────────────────────────────────────────────────
 controller = Controller()
 _word_buffer = []
-_enabled = True
-_enabled_lock = threading.Lock()
 _correction_log = []
 _log_lock = threading.Lock()
 _CTRL_DOWN = False
@@ -217,7 +324,6 @@ _apply_lock = threading.Lock()
 _last_correction = None   # dict: {"original": str, "corrected": str, "had_space": bool}
 _last_correction_lock = threading.Lock()
 _last_backspace_time = 0.0
-_UNDO_WINDOW = 0.15       # seconds — max gap between two backspace presses to trigger undo
 
 BOUNDARY_KEYS = {Key.space, Key.enter, Key.tab}
 PUNCT_CHARS = set(".!?,;:")
@@ -226,6 +332,38 @@ RESET_KEYS = {Key.left, Key.right, Key.up, Key.down, Key.home, Key.end, Key.esc}
 WORDS = Counter()        # frequency table — used for ranking candidates
 TRUSTED_WORDS: set = set()  # existence gate — a word must be here to be a valid correction target
 TOTAL_WORDS = 0
+
+# ── Bigram context (Feature: N-gram awareness) ──
+_prev_words = deque(maxlen=3)  # rolling buffer of recent flushed words
+BIGRAMS = Counter()            # bigram frequency table
+TOTAL_BIGRAMS = 0
+
+# ── Auto-capitalization (Feature: Smart capitalization) ──
+SENTENCE_END_CHARS = set(".!?")
+_sentence_end_pending = False
+_capitalize_next = False
+
+# ── Confusable words for context-aware retroactive correction ──
+CONFUSABLES = {
+    "to": ["too", "two"],
+    "too": ["to", "two"],
+    "two": ["to", "too"],
+    "their": ["they're", "there"],
+    "they're": ["their", "there"],
+    "there": ["their", "they're"],
+    "then": ["than"],
+    "than": ["then"],
+    "your": ["you're"],
+    "you're": ["your"],
+    "its": ["it's"],
+    "it's": ["its"],
+    "affect": ["effect"],
+    "effect": ["affect"],
+    "were": ["we're", "where"],
+    "we're": ["were", "where"],
+    "where": ["were", "we're"]
+}
+
 print("V4 LOADED")
 
 
@@ -259,6 +397,9 @@ def build_vocabulary():
                     w = line.strip().lower()
                     if 2 <= len(w) <= 30 and re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w):
                         TRUSTED_WORDS.add(w)
+            # Attempt to load custom dict
+            load_custom_dict()
+
             print(f"[INFO] Loaded trusted word list: {trusted_path} ({len(TRUSTED_WORDS):,} words)")
         except Exception as e:
             print(f"[WARN] Could not load TRUSTED_WORDS.txt: {e}")
@@ -281,10 +422,10 @@ def build_vocabulary():
     add_words_from_iterable(BASE_WORDS.split(), weight=20)
     add_words_from_iterable(CORRECTIONS.values(), weight=50)
 
-    # wordlist_10k.txt — frequency source ONLY.
+    # wordlist.txt — frequency source ONLY.
     # Words are listed roughly in frequency order (most common first).
     # We assign a decaying weight so rank-1 words get more weight than rank-10000.
-    extra_wordlist = os.path.join(base_dir, "wordlist_10k.txt")
+    extra_wordlist = os.path.join(base_dir, "wordlist.txt")
     if os.path.isfile(extra_wordlist):
         try:
             with open(extra_wordlist, "r", encoding="utf-8", errors="ignore") as f:
@@ -298,15 +439,17 @@ def build_vocabulary():
                     WORDS[w] += weight
             print(f"[INFO] Loaded frequency list: {extra_wordlist} ({len(lines):,} entries)")
         except Exception as e:
-            print(f"[WARN] Could not load wordlist_10k.txt: {e}")
+            print(f"[WARN] Could not load wordlist.txt: {e}")
 
     # corpus.txt — additional real-world frequency signal
     corpus_path = os.path.join(base_dir, "corpus.txt")
+    corpus_tokens = []
     if os.path.isfile(corpus_path):
         try:
             with open(corpus_path, "r", encoding="utf-8", errors="ignore") as f:
                 corpus_text = f.read()
-            add_words_from_iterable(tokenize(corpus_text), weight=5)
+            corpus_tokens = tokenize(corpus_text)
+            add_words_from_iterable(corpus_tokens, weight=5)
             print(f"[INFO] Loaded corpus frequencies: {corpus_path}")
         except Exception as e:
             print(f"[WARN] Could not load corpus.txt: {e}")
@@ -323,6 +466,29 @@ def build_vocabulary():
 
     TOTAL_WORDS = sum(WORDS.values())
 
+    # ── 3. BIGRAMS: context-aware ranking ──────────────────────────────
+    bigrams_path = os.path.join(base_dir, "Bigram.txt")
+    if os.path.isfile(bigrams_path):
+        try:
+            with open(bigrams_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) == 2:
+                        pair, weight = parts[0], int(parts[1])
+                        BIGRAMS[pair] += weight
+            print(f"[INFO] Loaded bigrams from {bigrams_path}")
+        except Exception as e:
+            print(f"[WARN] Could not load Bigram.txt: {e}")
+
+    # Extract bigrams from corpus.txt tokens
+    if len(corpus_tokens) >= 2:
+        for i in range(len(corpus_tokens) - 1):
+            pair = f"{corpus_tokens[i]} {corpus_tokens[i+1]}"
+            BIGRAMS[pair] += 3
+        print(f"[INFO] Extracted {len(BIGRAMS):,} unique bigrams")
+
+    TOTAL_BIGRAMS = sum(BIGRAMS.values()) or 1
+
 
 build_vocabulary()
 
@@ -334,6 +500,21 @@ def P(word: str) -> float:
     if TOTAL_WORDS == 0:
         return 0.0
     return WORDS[word] / TOTAL_WORDS
+
+
+def bigram_boost(prev_word: str, candidate: str) -> float:
+    """Return a context-aware probability boost for candidate given prev_word.
+
+    The boost is scaled to be comparable to unigram P() values so it acts
+    as a meaningful tiebreaker without dominating the frequency ranking.
+    """
+    if not prev_word or TOTAL_BIGRAMS == 0:
+        return 0.0
+    pair = f"{prev_word} {candidate}"
+    count = BIGRAMS.get(pair, 0)
+    if count == 0:
+        return 0.0
+    return (count / TOTAL_BIGRAMS) * 0.5
 
 
 def known(candidates):
@@ -451,7 +632,8 @@ def choose_best_candidate(original: str, candidates):
     return best, second
 
 
-def correction(word: str) -> str | None:
+def correction(word: str, prev_word: str = None) -> str | None:
+    global GUI_UNKNOWN_TOKENS
     lower = word.lower()
 
     # Basic guards
@@ -482,6 +664,9 @@ def correction(word: str) -> str | None:
         ed = 2
 
     if not candidates:
+        GUI_UNKNOWN_TOKENS += 1
+        record_daily_stat("unknown")
+        log_unknown(lower)
         return None
 
     # 5) Remove the original if somehow present
@@ -489,8 +674,11 @@ def correction(word: str) -> str | None:
     if not candidates:
         return None
 
-    # 6) Pick the most probable candidate
-    best = max(candidates, key=P)
+    # 6) Pick the most probable candidate, with bigram context boost
+    def _score(c):
+        boost = bigram_boost(prev_word, c) if ENABLE_BIGRAMS else 0.0
+        return P(c) + boost
+    best = max(candidates, key=_score)
 
     # 7) Guardrails — deliberately relaxed so real typos get fixed
 
@@ -509,7 +697,7 @@ def correction(word: str) -> str | None:
     # For edit-distance-1, trust the frequency ranking directly — no confidence
     # threshold needed because the candidate space is small and well-constrained.
     if ed == 2 and len(candidates) > 1:
-        sorted_cands = sorted(candidates, key=P, reverse=True)
+        sorted_cands = sorted(candidates, key=_score, reverse=True)
         second = sorted_cands[1]
         # Only block if the best isn't clearly more probable (3× threshold)
         if P(best) < 3.0 * P(second):
@@ -523,11 +711,18 @@ def correction(word: str) -> str | None:
 # LOGGING / APPLY
 # ─────────────────────────────────────────────────────
 def _log(original, corrected):
+    global GUI_CORRECTIONS_APPLIED
+    
     with _log_lock:
         ts = time.strftime("%H:%M:%S")
         _correction_log.append((ts, original, corrected))
         if len(_correction_log) > 200:
             _correction_log.pop(0)
+
+    GUI_CORRECTIONS_APPLIED += 1
+    record_daily_stat("corrected")
+    _notify_log(original, corrected)
+    _notify_stats()
 
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
@@ -535,7 +730,7 @@ def _log(original, corrected):
     print(f"  [{ts}]  {YELLOW}{original}{RESET}  →  {GREEN}{corrected}{RESET}")
 
 
-def _apply_correction(original: str, corrected: str, boundary_was_space: bool):
+def _apply_correction(original: str, corrected: str, boundary_was_space: bool, retro_original: str = None, retro_corrected: str = None):
     global _suppress_typed_keys, _word_buffer, _last_correction
 
     with _apply_lock:
@@ -544,11 +739,16 @@ def _apply_correction(original: str, corrected: str, boundary_was_space: bool):
 
         try:
             delete_count = len(original) + (1 if boundary_was_space else 0)
+            if retro_original and retro_corrected:
+                delete_count += 1 + len(retro_original)
 
             for _ in range(delete_count):
                 controller.press(Key.backspace)
                 controller.release(Key.backspace)
                 time.sleep(0.004)
+
+            if retro_original and retro_corrected:
+                controller.type(retro_corrected + " ")
 
             controller.type(corrected)
 
@@ -558,6 +758,8 @@ def _apply_correction(original: str, corrected: str, boundary_was_space: bool):
 
             _word_buffer.clear()
             _log(original, corrected)
+            if retro_original and retro_corrected:
+                _log(retro_original, retro_corrected)
 
             # Save undo info so a quick backspace double-tap can revert
             with _last_correction_lock:
@@ -637,7 +839,8 @@ def _apply_undo():
 
 
 def _flush_buffer(boundary_was_space: bool):
-    global _word_buffer
+    global _word_buffer, _capitalize_next
+    global GUI_WORDS_SCANNED, GUI_TOTAL_PROCESSING_TIME
 
     if not _word_buffer:
         return
@@ -656,15 +859,79 @@ def _flush_buffer(boundary_was_space: bool):
     if " " in stripped:
         return
 
-    corrected = correction(stripped)
-    if corrected and corrected != stripped:
-        full_correction = corrected + suffix
+    GUI_WORDS_SCANNED += 1
+    record_daily_stat("scanned")
+    t0 = time.perf_counter()
+
+    # Get previous word for bigram context
+    prev = _prev_words[-1] if _prev_words else None
+
+    # --- 1. Retroactive confusable correction ---
+    retro_original = None
+    retro_corrected = None
+    
+    if ENABLE_BIGRAMS and prev and prev.lower() in CONFUSABLES:
+        best_retro = prev.lower()
+        pair_key = f"{best_retro} {stripped.lower()}"
+        best_retro_count = BIGRAMS.get(pair_key, 0)
+        
+        for cand in CONFUSABLES[best_retro]:
+            cand_pair = f"{cand} {stripped.lower()}"
+            cand_count = BIGRAMS.get(cand_pair, 0)
+            # Threshold: must have a solid count (>= 5) and be significantly more common (> 2x)
+            if cand_count >= 5 and cand_count > best_retro_count * 2:
+                best_retro = cand
+                best_retro_count = cand_count
+                
+        if best_retro != prev.lower():
+            retro_original = prev
+            retro_corrected = preserve_case(prev, best_retro)
+            # Update history so future words see the corrected context
+            _prev_words[-1] = retro_corrected.lower()
+            prev = retro_corrected.lower()
+
+    # --- 2. Current word spelling correction ---
+    corrected = correction(stripped, prev_word=prev)
+    final_word = corrected if (corrected and corrected != stripped) else stripped
+
+    # --- 3. Current word confusable correction ---
+    if ENABLE_BIGRAMS and prev and is_valid(stripped.lower()) and stripped.lower() in CONFUSABLES:
+        best_current = stripped.lower()
+        pair_key = f"{prev} {best_current}"
+        best_current_count = BIGRAMS.get(pair_key, 0)
+        
+        for cand in CONFUSABLES[best_current]:
+            cand_pair = f"{prev} {cand}"
+            cand_count = BIGRAMS.get(cand_pair, 0)
+            if cand_count >= 5 and cand_count > best_current_count * 2:
+                best_current = cand
+                best_current_count = cand_count
+                
+        if best_current != stripped.lower():
+            final_word = preserve_case(stripped, best_current)
+
+    # Auto-capitalize after sentence boundary (.!? followed by space/enter)
+    if ENABLE_CAPITALIZATION and _capitalize_next and final_word and final_word[0].islower():
+        final_word = final_word[0].upper() + final_word[1:]
+    _capitalize_next = False  # always consume the flag after processing a word
+
+    # Track this word for future bigram context
+    _prev_words.append(final_word.lower())
+
+    # Apply if anything changed (spelling correction, retroactive, capitalization)
+    if final_word != stripped or retro_corrected:
+        full_correction = final_word + suffix
         t = threading.Thread(
             target=_apply_correction,
-            args=(word, full_correction, boundary_was_space),
+            args=(word, full_correction, boundary_was_space, retro_original, retro_corrected),
             daemon=True,
         )
         t.start()
+        
+    processing_time = (time.perf_counter() - t0)
+    GUI_TOTAL_PROCESSING_TIME += processing_time
+    record_daily_stat("time_ms", processing_time * 1000)
+    _notify_stats()
 
 
 # ─────────────────────────────────────────────────────
@@ -677,8 +944,36 @@ def is_valid(word: str) -> bool:
     # Fallback if TRUSTED_WORDS.txt wasn't loaded
     return word in WORDS
 def on_press(key):
-    global _CTRL_DOWN, _SHIFT_DOWN, _enabled, _backspace_down
-    global _last_backspace_time, _last_correction
+    global _CTRL_DOWN, _SHIFT_DOWN, _backspace_down
+    global _capitalize_next, _last_backspace_time
+    global MASTER_ENABLE
+
+    with _suppress_lock:
+        if _suppress_typed_keys:
+            return
+
+    if key in (Key.ctrl, Key.ctrl_l, Key.ctrl_r):
+        _CTRL_DOWN = True
+    if key in (Key.shift, Key.shift_l, Key.shift_r):
+        _SHIFT_DOWN = True
+
+    try:
+        if _CTRL_DOWN and _SHIFT_DOWN and hasattr(key, "char") and key.char in ("a", "A"):
+            MASTER_ENABLE = not MASTER_ENABLE
+            status = "\033[92mENABLED\033[0m" if MASTER_ENABLE else "\033[91mDISABLED\033[0m"
+            print(f"\n  ── AutoCorrect {status} ──\n")
+            _word_buffer.clear()
+            _notify_toggle(MASTER_ENABLE)
+            return
+    except Exception:
+        pass
+
+    if not MASTER_ENABLE:
+        _word_buffer.clear()
+        return
+
+    global _last_correction
+    global _sentence_end_pending, _capitalize_next
 
     with _suppress_lock:
         if _suppress_typed_keys:
@@ -700,13 +995,20 @@ def on_press(key):
     except Exception:
         pass
 
-    with _enabled_lock:
-        if not _enabled:
-            return
+
 
     try:
         if key in BOUNDARY_KEYS:
             _flush_buffer(boundary_was_space=(key == Key.space))
+
+            # Sentence boundary: if we saw .!? before this space/enter, capitalize next word
+            if _sentence_end_pending:
+                _capitalize_next = True
+                _sentence_end_pending = False
+
+            # Enter always starts a new sentence (new paragraph)
+            if key == Key.enter:
+                _capitalize_next = True
 
         elif key == Key.backspace:
             if _backspace_down:
@@ -722,7 +1024,7 @@ def on_press(key):
             with _last_correction_lock:
                 has_undo = _last_correction is not None
 
-            if gap <= _UNDO_WINDOW and has_undo:
+            if gap <= UNDO_WINDOW and has_undo:
                 # Spawn undo on a thread (same pattern as corrections)
                 t = threading.Thread(target=_apply_undo, daemon=True)
                 t.start()
@@ -733,6 +1035,9 @@ def on_press(key):
 
         elif key in RESET_KEYS:
             _word_buffer.clear()
+            _prev_words.clear()
+            _sentence_end_pending = False
+            _capitalize_next = False
             # Any navigation clears undo availability
             with _last_correction_lock:
                 _last_correction = None
@@ -742,6 +1047,11 @@ def on_press(key):
 
             if ch in PUNCT_CHARS:
                 _flush_buffer(boundary_was_space=False)
+                # Track sentence-ending punctuation for auto-capitalization
+                if ch in SENTENCE_END_CHARS:
+                    _sentence_end_pending = True
+                else:
+                    _sentence_end_pending = False
             elif ch.isprintable():
                 _word_buffer.append(ch)
 
@@ -769,8 +1079,8 @@ def on_release(key):
 # ─────────────────────────────────────────────────────
 BANNER = """
 \033[96m╔══════════════════════════════════════════════════════╗
-║        AutoCorrect Daemon v3.1 (Stable, No Undo)    ║
-║    System-wide spell correction across all apps     ║
+║        AutoCorrect Daemon v4.0 (Context-Aware)       ║
+║    System-wide spell correction across all apps      ║
 ╚══════════════════════════════════════════════════════╝\033[0m
 
   \033[92m●  Running\033[0m  —  corrections will appear below as they happen
@@ -786,43 +1096,56 @@ BANNER = """
     - known word? keep it
     - known edit-distance 1 candidates
     - known edit-distance 2 candidates (only for longer words)
-
-  Guardrails:
-    - no difflib/fuzzy matching
-    - no singularizing/plural collapsing
-    - no aggressive guessing on short words
-    - undo disabled for stability
+    - bigram context ranking
+    - confusable retroactive fixes
 
   Optional files in same folder:
-    - wordlist_10k.txt   (one word per line)
+    - wordlist.txt       (one word per line)
     - corpus.txt         (text used for frequency ranking)
+    - Bigram.txt         (bigram occurrences for context)
 
   ────────────────────────────────────────────────────
   TIME      TYPED          →  CORRECTED
   ────────────────────────────────────────────────────
 """
 
-
-def main():
-    print(BANNER.format(
-        dict_count=len(CORRECTIONS),
-        vocab_count=len(WORDS),
-        token_count=TOTAL_WORDS
-    ))
-
-    if sys.platform == "darwin":
-        print("  \033[93m[macOS]\033[0m If keys aren't intercepted, grant Accessibility access:")
-        print("         System Settings → Privacy & Security → Accessibility → add Terminal\n")
-    elif sys.platform.startswith("linux"):
-        if hasattr(os, "geteuid") and os.geteuid() != 0:
-            print("  \033[93m[Linux]\033[0m If keys aren't intercepted, try running with sudo\n")
-
-    try:
+def start_in_background():
+    """Starts the listener in a background daemon thread (for GUI integration)."""
+    if not WORDS:
+        build_vocabulary()
+    
+    def run_listener():
         with Listener(on_press=on_press, on_release=on_release) as listener:
             listener.join()
-    except KeyboardInterrupt:
-        print("\n\n  \033[91mStopped.\033[0m  AutoCorrect Daemon exited.\n")
-        sys.exit(0)
+            
+    t = threading.Thread(target=run_listener, daemon=True)
+    t.start()
+
+
+def main():
+    try:
+        import gui
+        gui.launch()
+    except Exception as e:
+        # Fallback to terminal mode if GUI fails or PySide6 is missing
+        print(f"[SYSTEM] GUI Launch failed: {e}")
+        print("[SYSTEM] Falling back to Terminal mode...")
+        
+        print(BANNER.format(
+            dict_count=len(CORRECTIONS),
+            vocab_count=len(WORDS),
+            token_count=TOTAL_WORDS
+        ))
+
+        if sys.platform == "darwin":
+            print("  \033[93m[macOS]\033[0m If keys aren't intercepted, grant Accessibility access:")
+            print("         System Settings → Privacy & Security → Accessibility → add Terminal\n")
+        elif sys.platform.startswith("linux"):
+            if hasattr(os, "geteuid") and os.geteuid() != 0:
+                print("  \033[93m[Linux]\033[0m If keys aren't intercepted, try running with sudo\n")
+
+        with Listener(on_press=on_press, on_release=on_release) as listener:
+            listener.join()
 
 
 if __name__ == "__main__":

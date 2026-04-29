@@ -1,0 +1,23 @@
+# User Data (Personal)
+stats.json
+unknown.txt
+custom_dict.txt
+
+# Python Artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Editor / System
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
