@@ -62,6 +62,8 @@ except ImportError:
 # ─────────────────────────────────────────────────────
 CORRECTIONS = {
     "teh": "the", "hte": "the", "tge": "the", "thw": "the",
+    "smth": "something", 
+    "wdym": "what do you mean","idk":"I don't know","lol":"laughing out loud","brb":"be right back","tbh":"to be honest","omg":"oh my god","btw":"by the way","fyi":"for your information","imo":"in my opinion","irl":"in real life","tmi":"too much information","ttyl":"talk to you later","g2g":"got to go","bbl":"be back later","smh":"shaking my head","fomo":"fear of missing out","ikr":"I know right","ngl":"not gonna lie","fr":"for real","wyd":"what are you doing",
     "adn": "and", "nad": "and", "annd": "and",
     "siad": "said", "sayd": "said",
     "taht": "that", "htat": "that", "tath": "that",
@@ -210,11 +212,19 @@ _suppress_lock = threading.Lock()
 _backspace_down = False
 _apply_lock = threading.Lock()
 
+# ── Undo state ──
+# Remembers the most recent correction so a quick backspace double-tap reverts it.
+_last_correction = None   # dict: {"original": str, "corrected": str, "had_space": bool}
+_last_correction_lock = threading.Lock()
+_last_backspace_time = 0.0
+_UNDO_WINDOW = 0.15       # seconds — max gap between two backspace presses to trigger undo
+
 BOUNDARY_KEYS = {Key.space, Key.enter, Key.tab}
 PUNCT_CHARS = set(".!?,;:")
 RESET_KEYS = {Key.left, Key.right, Key.up, Key.down, Key.home, Key.end, Key.esc}
 
-WORDS = Counter()
+WORDS = Counter()        # frequency table — used for ranking candidates
+TRUSTED_WORDS: set = set()  # existence gate — a word must be here to be a valid correction target
 TOTAL_WORDS = 0
 print("V4 LOADED")
 
@@ -236,26 +246,67 @@ def add_words_from_iterable(words_iterable, weight=1):
 def build_vocabulary():
     global TOTAL_WORDS
 
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # ── 1. TRUSTED_WORDS: the existence gate ──────────────────────────────────
+    # A word must be in TRUSTED_WORDS to be a valid correction target.
+    # We seed it from BASE_WORDS, CORRECTIONS targets, and TRUSTED_WORDS.txt.
+    trusted_path = os.path.join(base_dir, "TRUSTED_WORDS.txt")
+    if os.path.isfile(trusted_path):
+        try:
+            with open(trusted_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    w = line.strip().lower()
+                    if 2 <= len(w) <= 30 and re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w):
+                        TRUSTED_WORDS.add(w)
+            print(f"[INFO] Loaded trusted word list: {trusted_path} ({len(TRUSTED_WORDS):,} words)")
+        except Exception as e:
+            print(f"[WARN] Could not load TRUSTED_WORDS.txt: {e}")
+    else:
+        print("[WARN] TRUSTED_WORDS.txt not found — falling back to WORDS for existence check")
+
+    # Always trust BASE_WORDS and correction targets
+    for w in BASE_WORDS.split():
+        w = w.strip().lower()
+        if w:
+            TRUSTED_WORDS.add(w)
+    for v in CORRECTIONS.values():
+        v = v.strip().lower()
+        # multi-word corrections (e.g. "a lot") — trust each token
+        for tok in v.split():
+            TRUSTED_WORDS.add(tok)
+
+    # ── 2. WORDS (frequency table): used only for ranking candidates ──────────
+    # Seed with BASE_WORDS and correction targets at high weight.
     add_words_from_iterable(BASE_WORDS.split(), weight=20)
     add_words_from_iterable(CORRECTIONS.values(), weight=50)
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-
+    # wordlist_10k.txt — frequency source ONLY.
+    # Words are listed roughly in frequency order (most common first).
+    # We assign a decaying weight so rank-1 words get more weight than rank-10000.
     extra_wordlist = os.path.join(base_dir, "wordlist_10k.txt")
     if os.path.isfile(extra_wordlist):
         try:
             with open(extra_wordlist, "r", encoding="utf-8", errors="ignore") as f:
-                add_words_from_iterable((line.strip() for line in f), weight=15)
-            print(f"[INFO] Loaded extra word list: {extra_wordlist}")
+                lines = [l.strip().lower() for l in f if l.strip()]
+            total = max(len(lines), 1)
+            for rank, raw in enumerate(lines):
+                w = raw.strip().lower()
+                if 2 <= len(w) <= 30 and re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w):
+                    # Weight decays from ~200 (rank 0) down to ~1 (rank total-1)
+                    weight = max(1, int(200 * (1 - rank / total)))
+                    WORDS[w] += weight
+            print(f"[INFO] Loaded frequency list: {extra_wordlist} ({len(lines):,} entries)")
         except Exception as e:
             print(f"[WARN] Could not load wordlist_10k.txt: {e}")
 
+    # corpus.txt — additional real-world frequency signal
     corpus_path = os.path.join(base_dir, "corpus.txt")
     if os.path.isfile(corpus_path):
         try:
             with open(corpus_path, "r", encoding="utf-8", errors="ignore") as f:
                 corpus_text = f.read()
-            add_words_from_iterable(tokenize(corpus_text), weight=1)
+            add_words_from_iterable(tokenize(corpus_text), weight=5)
             print(f"[INFO] Loaded corpus frequencies: {corpus_path}")
         except Exception as e:
             print(f"[WARN] Could not load corpus.txt: {e}")
@@ -286,6 +337,11 @@ def P(word: str) -> float:
 
 
 def known(candidates):
+    """Return candidates that are both trusted (exist) AND have a frequency score."""
+    if TRUSTED_WORDS:
+        # Prefer: word must be in the trusted existence set.
+        # Fall back to WORDS alone if TRUSTED_WORDS wasn't loaded.
+        return {w for w in candidates if w in TRUSTED_WORDS and w in WORDS}
     return {w for w in candidates if w in WORDS}
 
 
@@ -302,7 +358,9 @@ def edits2_known(word: str):
     out = set()
     for e1 in edits1(word):
         for e2 in edits1(e1):
-            if e2 in WORDS:
+            # Must pass the same existence gate as known()
+            if (TRUSTED_WORDS and e2 in TRUSTED_WORDS and e2 in WORDS) or \
+               (not TRUSTED_WORDS and e2 in WORDS):
                 out.add(e2)
     return out
 
@@ -347,12 +405,24 @@ def looks_like_simple_inflection(original: str, candidate: str) -> bool:
     return False
 
 
+def edit_distance_bucket(original: str, candidate: str) -> int:
+    if candidate in known(edits1(original)):
+        return 1
+    return 2
+
+
 def candidate_score(original: str, candidate: str):
+    dist = edit_distance_bucket(original, candidate)
     same_first = 1 if candidate and original and candidate[0] == original[0] else 0
+    same_last = 1 if candidate and original and candidate[-1] == original[-1] else 0
+
+    # Lower distance is better.
+    # Frequency only matters after distance.
     return (
+        -dist,
+        same_first + same_last,
         P(candidate),
         -abs(len(candidate) - len(original)),
-        same_first,
     )
 
 
@@ -378,61 +448,75 @@ def choose_best_candidate(original: str, candidates):
 
     best = filtered[0]
     second = filtered[1] if len(filtered) > 1 else None
-
     return best, second
 
 
 def correction(word: str) -> str | None:
     lower = word.lower()
 
+    # Basic guards
     if len(lower) < 2:
         return None
-
     if not is_word_like(word):
         return None
 
+    # 1) Explicit typo map always wins
     if lower in CORRECTIONS:
         return preserve_case(word, CORRECTIONS[lower])
 
-    if lower in WORDS:
+    # 2) Known / trusted word? keep it (do not correct)
+    if is_valid(lower):
         return None
 
-    if len(lower) <= 4:
+    # 3) Don't guess on very short words
+    if len(lower) <= 3:
         return None
 
-    def maybe_pick(candidates):
-        result = choose_best_candidate(lower, candidates)
-        if not result:
-            return None
-
-        best, second = result
-
-        if lower[0] != best[0] or lower[-1] != best[-1]:
-            return None
-
-        p_best = P(best)
-        p_second = P(second) if second else 0.0
-
-        if second is not None and p_best < (1.5 * p_second):
-            return None
-
-        if len(lower) <= 6 and p_best < 1e-5:
-            return None
-
-        return best
-
+    # 4) Generate candidates (edit distance 1, optionally 2)
     cands1 = known(edits1(lower))
-    cand = maybe_pick(cands1)
-    if cand:
-        return preserve_case(word, cand)
+    if cands1:
+        candidates = cands1
+        ed = 1
+    else:
+        candidates = edits2_known(lower)
+        ed = 2
 
-    if len(lower) >= 7:
-        cands2 = edits2_known(lower)
-        cand = maybe_pick(cands2)
-        if cand:
-            return preserve_case(word, cand)
+    if not candidates:
+        return None
 
-    return None
+    # 5) Remove the original if somehow present
+    candidates.discard(lower)
+    if not candidates:
+        return None
+
+    # 6) Pick the most probable candidate
+    best = max(candidates, key=P)
+
+    # 7) Guardrails — deliberately relaxed so real typos get fixed
+
+    # Start letter must match (hard rule: avoids wild substitutions)
+    if lower[0] != best[0]:
+        return None
+
+    # Avoid stripping valid inflections  (e.g. "words" → "word", "allowed" → "allow")
+    # But ONLY block this when the correction shortens the word — not when it
+    # changes it substantially (e.g. "chiken" → "chicken" is fine).
+    if looks_like_simple_inflection(lower, best) and len(best) <= len(lower):
+        return None
+
+    # For edit-distance-2 corrections, require the candidate to be meaningfully
+    # more probable than the second-best (avoids random guesses on long typos).
+    # For edit-distance-1, trust the frequency ranking directly — no confidence
+    # threshold needed because the candidate space is small and well-constrained.
+    if ed == 2 and len(candidates) > 1:
+        sorted_cands = sorted(candidates, key=P, reverse=True)
+        second = sorted_cands[1]
+        # Only block if the best isn't clearly more probable (3× threshold)
+        if P(best) < 3.0 * P(second):
+            return None
+
+    return preserve_case(word, best)
+
 
 
 # ─────────────────────────────────────────────────────
@@ -452,7 +536,7 @@ def _log(original, corrected):
 
 
 def _apply_correction(original: str, corrected: str, boundary_was_space: bool):
-    global _suppress_typed_keys, _word_buffer
+    global _suppress_typed_keys, _word_buffer, _last_correction
 
     with _apply_lock:
         with _suppress_lock:
@@ -475,6 +559,77 @@ def _apply_correction(original: str, corrected: str, boundary_was_space: bool):
             _word_buffer.clear()
             _log(original, corrected)
 
+            # Save undo info so a quick backspace double-tap can revert
+            with _last_correction_lock:
+                _last_correction = {
+                    "original": original,
+                    "corrected": corrected,
+                    "had_space": boundary_was_space,
+                }
+
+        finally:
+            time.sleep(0.02)
+            with _suppress_lock:
+                _suppress_typed_keys = False
+
+
+def _apply_undo():
+    """Revert the most recent autocorrection, restoring the original typed text.
+
+    IMPORTANT: pynput does NOT suppress key events — by the time this runs,
+    both backspace keypresses have already been processed by the OS, which
+    means 2 characters have already been deleted from the screen.  We must
+    subtract those 2 from our own delete count so we don't eat into the
+    text that preceded the corrected word.
+    """
+    global _suppress_typed_keys, _word_buffer, _last_correction
+
+    with _last_correction_lock:
+        info = _last_correction
+        _last_correction = None  # one-shot: clear immediately
+
+    if info is None:
+        return
+
+    corrected = info["corrected"]
+    original = info["original"]
+    had_space = info["had_space"]
+
+    # Small delay to let the OS finish processing the 2 physical backspaces
+    time.sleep(0.05)
+
+    with _apply_lock:
+        with _suppress_lock:
+            _suppress_typed_keys = True
+
+        try:
+            # Total chars the corrected word occupied on screen
+            full_len = len(corrected) + (1 if had_space else 0)
+
+            # The OS already deleted 2 chars (one per backspace tap),
+            # so we only need to remove the remainder.
+            remaining = max(0, full_len - 2)
+
+            for _ in range(remaining):
+                controller.press(Key.backspace)
+                controller.release(Key.backspace)
+                time.sleep(0.004)
+
+            # Restore the original typed text
+            controller.type(original)
+
+            if had_space:
+                controller.press(Key.space)
+                controller.release(Key.space)
+
+            _word_buffer.clear()
+
+            # Log the undo
+            ts = time.strftime("%H:%M:%S")
+            CYAN = "\033[96m"
+            RESET_C = "\033[0m"
+            print(f"  [{ts}]  {CYAN}UNDO{RESET_C}  {corrected}  →  {original}")
+
         finally:
             time.sleep(0.02)
             with _suppress_lock:
@@ -493,7 +648,7 @@ def _flush_buffer(boundary_was_space: bool):
     stripped = word.rstrip("".join(PUNCT_CHARS))
     suffix = word[len(stripped):]
 
-    print(f"FLUSH: raw={word!r}, stripped={stripped!r}, suffix={suffix!r}, space={boundary_was_space}")
+    # print(f"FLUSH: raw={word!r}, stripped={stripped!r}, suffix={suffix!r}, space={boundary_was_space}")
 
     if not stripped:
         return
@@ -515,8 +670,15 @@ def _flush_buffer(boundary_was_space: bool):
 # ─────────────────────────────────────────────────────
 # KEYBOARD EVENTS
 # ─────────────────────────────────────────────────────
+def is_valid(word: str) -> bool:
+    """Return True if the word should be left alone (it's a real, known word)."""
+    if TRUSTED_WORDS:
+        return word in TRUSTED_WORDS
+    # Fallback if TRUSTED_WORDS.txt wasn't loaded
+    return word in WORDS
 def on_press(key):
     global _CTRL_DOWN, _SHIFT_DOWN, _enabled, _backspace_down
+    global _last_backspace_time, _last_correction
 
     with _suppress_lock:
         if _suppress_typed_keys:
@@ -552,11 +714,28 @@ def on_press(key):
 
             _backspace_down = True
 
+            # ── Double-tap backspace → undo last correction ──
+            now = time.monotonic()
+            gap = now - _last_backspace_time
+            _last_backspace_time = now
+
+            with _last_correction_lock:
+                has_undo = _last_correction is not None
+
+            if gap <= _UNDO_WINDOW and has_undo:
+                # Spawn undo on a thread (same pattern as corrections)
+                t = threading.Thread(target=_apply_undo, daemon=True)
+                t.start()
+                return   # swallow this backspace — undo handles everything
+
             if _word_buffer:
                 _word_buffer.pop()
 
         elif key in RESET_KEYS:
             _word_buffer.clear()
+            # Any navigation clears undo availability
+            with _last_correction_lock:
+                _last_correction = None
 
         elif hasattr(key, "char") and key.char is not None:
             ch = key.char
@@ -565,6 +744,10 @@ def on_press(key):
                 _flush_buffer(boundary_was_space=False)
             elif ch.isprintable():
                 _word_buffer.append(ch)
+
+            # Any typing clears undo availability
+            with _last_correction_lock:
+                _last_correction = None
 
     except Exception:
         pass
