@@ -63,7 +63,7 @@ STATS_FILE = "stats.json"
 CUSTOM_DICT_FILE = "custom_dict.txt"
 UNKNOWN_FILE = "unknown.txt"
 CONFIG_FILE = "config.json"
-
+global _suppress_typed_keys
 def save_config():
     config = {
         "ENABLE_BIGRAMS": ENABLE_BIGRAMS,
@@ -1159,7 +1159,7 @@ def on_press(key):
                     
                     # 2. Synchronous replacement (faster & more predictable than threading)
                     with _suppress_lock:
-                        global _suppress_typed_keys
+                        
                         _suppress_typed_keys = True
                     try:
                         # Tap backspace to remove the lowercase char that just hit the OS
