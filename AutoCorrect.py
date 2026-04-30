@@ -58,6 +58,10 @@ ENABLE_CAPITALIZATION = True
 UNDO_WINDOW = 0.15
 MASTER_ENABLE = True
 
+# Pre-compiled regex patterns for speed
+WORD_PATTERN = re.compile(r"[a-z]+(?:'[a-z]+)?")
+WORDLIKE_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+
 # Persistence Files
 STATS_FILE = "stats.json"
 CUSTOM_DICT_FILE = "custom_dict.txt"
@@ -497,13 +501,14 @@ print("V4 LOADED")
 # VOCAB / CORPUS BUILDING
 # ─────────────────────────────────────────────────────
 def tokenize(text: str):
-    return re.findall(r"[a-z]+(?:'[a-z]+)?", text.lower())
+    """Tokenize text into lowercase words using pre-compiled regex."""
+    return WORD_PATTERN.findall(text.lower())
 
 
 def add_words_from_iterable(words_iterable, weight=1):
     for w in words_iterable:
         w = w.strip().lower()
-        if 2 <= len(w) <= 30 and re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w):
+        if 2 <= len(w) <= 30 and WORD_PATTERN.fullmatch(w):
             WORDS[w] += weight
             VOCAB_TRIE.insert(w)
             TRUSTED_WORDS.add(w)
@@ -523,7 +528,7 @@ def build_vocabulary():
             with open(trusted_path, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     w = line.strip().lower()
-                    if 2 <= len(w) <= 30 and re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w):
+                    if 2 <= len(w) <= 30 and WORD_PATTERN.fullmatch(w):
                         TRUSTED_WORDS.add(w)
                         VOCAB_TRIE.insert(w)
             
@@ -562,7 +567,7 @@ def build_vocabulary():
             total = max(len(lines), 1)
             for rank, raw in enumerate(lines):
                 w = raw.strip().lower()
-                if 2 <= len(w) <= 30 and re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w):
+                if 2 <= len(w) <= 30 and WORD_PATTERN.fullmatch(w):
                     # Weight decays from ~200 (rank 0) down to ~1 (rank total-1)
                     weight = max(1, int(200 * (1 - rank / total)))
                     WORDS[w] += weight
@@ -605,27 +610,28 @@ def build_vocabulary():
     TOTAL_WORDS = sum(WORDS.values()) or 1000
 
     # ── 3. BIGRAMS: context-aware ranking ──────────────────────────────
-    bigrams_path = os.path.join(base_dir, "Bigram.txt")
-    if os.path.isfile(bigrams_path):
-        try:
-            with open(bigrams_path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    parts = line.strip().split(",")
-                    if len(parts) == 2:
-                        pair, weight = parts[0], int(parts[1])
-                        BIGRAMS[pair] += weight
-            print(f"[INFO] Loaded bigrams from {bigrams_path}")
-        except Exception as e:
-            print(f"[WARN] Could not load Bigram.txt: {e}")
+    if ENABLE_BIGRAMS:
+        bigrams_path = os.path.join(base_dir, "Bigram.txt")
+        if os.path.isfile(bigrams_path):
+            try:
+                with open(bigrams_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if "," not in line:
+                            continue
+                        pair, _, weight_str = line.strip().partition(",")
+                        BIGRAMS[pair] += int(weight_str)
+                print(f"[INFO] Loaded bigrams from {bigrams_path}")
+            except Exception as e:
+                print(f"[WARN] Could not load Bigram.txt: {e}")
 
-    # Extract bigrams from corpus.txt tokens
-    if len(corpus_tokens) >= 2:
-        for i in range(len(corpus_tokens) - 1):
-            pair = f"{corpus_tokens[i]} {corpus_tokens[i+1]}"
-            BIGRAMS[pair] += 3
-        print(f"[INFO] Extracted {len(BIGRAMS):,} unique bigrams")
+        # Extract bigrams from corpus.txt tokens
+        if len(corpus_tokens) >= 2:
+            for i in range(len(corpus_tokens) - 1):
+                pair = f"{corpus_tokens[i]} {corpus_tokens[i+1]}"
+                BIGRAMS[pair] += 3
+            print(f"[INFO] Extracted {len(BIGRAMS):,} unique bigrams")
 
-    TOTAL_BIGRAMS = sum(BIGRAMS.values()) or 1
+        TOTAL_BIGRAMS = sum(BIGRAMS.values()) or 1
 
 
 build_vocabulary()
@@ -655,15 +661,6 @@ def bigram_boost(prev_word: str, candidate: str) -> float:
     return (count / TOTAL_BIGRAMS) * 0.5
 
 
-def known(candidates):
-    """Return candidates that are both trusted (exist) AND have a frequency score."""
-    if TRUSTED_WORDS:
-        # Prefer: word must be in the trusted existence set.
-        # Fall back to WORDS alone if TRUSTED_WORDS wasn't loaded.
-        return {w for w in candidates if w in TRUSTED_WORDS and w in WORDS}
-    return {w for w in candidates if w in WORDS}
-
-
 def edits1(word: str):
     """Return distance-1 edits using Trie fuzzy search."""
     # We return a set for compatibility with existing logic
@@ -685,7 +682,7 @@ def preserve_case(original: str, corrected: str) -> str:
 
 
 def is_word_like(s: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z]+(?:'[A-Za-z]+)?", s))
+    return bool(WORDLIKE_PATTERN.fullmatch(s))
 
 
 def looks_like_simple_inflection(original: str, candidate: str) -> bool:
@@ -717,12 +714,13 @@ def looks_like_simple_inflection(original: str, candidate: str) -> bool:
     return False
 
 
+@lru_cache(maxsize=512)
 def correction(word: str, prev_word: str = None) -> str | None:
     global GUI_UNKNOWN_TOKENS
     lower = word.lower()
 
     # Basic guards
-    if len(lower) < 2:
+    if len(lower) <= 2: # Ignore words 1-2 chars (high noise, low typo chance)
         return None
     if not is_word_like(word):
         return None
@@ -733,10 +731,6 @@ def correction(word: str, prev_word: str = None) -> str | None:
 
     # 2) Known / trusted word? keep it (do not correct)
     if is_valid(lower):
-        return None
-
-    # 3) Don't guess on very short words
-    if len(lower) <= 3:
         return None
 
     # 4) Generate candidates (edit distance 1, optionally 2)
