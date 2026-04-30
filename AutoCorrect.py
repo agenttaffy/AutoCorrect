@@ -1150,47 +1150,26 @@ def on_press(key):
                 _flush_buffer(boundary_was_space=False)
                 _recent_chars.append(ch)
             elif ch.isprintable():
-                # Immediate Auto-Capitalization Logic
+                # Immediate Auto-Capitalization logic
                 if should_autocap_on_char(ch, _recent_chars):
-                    # Intercept and type uppercase version
-                    final_ch = ch.upper()
+                    # 1. Update state
+                    upper_ch = ch.upper()
+                    _word_buffer.append(upper_ch)
+                    _recent_chars.append(upper_ch)
                     
-                    # We need to suppress the current key and type the upper one
-                    # However, since we are in a listener and NOT using a global suppress
-                    # for every key, we can simply update the word_buffer and then
-                    # if we were to apply a correction later it would use the upper char.
-                    # BUT the user asked for it to be "fast" and "on char input".
-                    # This implies the character typed into the application should be upper.
-                    
-                    # Implementation: Suppress the lowercase char and type the uppercase one.
-                    def _do_cap_swap(original_ch, upper_ch):
+                    # 2. Synchronous replacement (faster & more predictable than threading)
+                    with _suppress_lock:
+                        global _suppress_typed_keys
+                        _suppress_typed_keys = True
+                    try:
+                        # Tap backspace to remove the lowercase char that just hit the OS
+                        controller.press(Key.backspace)
+                        controller.release(Key.backspace)
+                        # Type the uppercase version
+                        controller.type(upper_ch)
+                    finally:
                         with _suppress_lock:
-                            global _suppress_typed_keys
-                            _suppress_typed_keys = True
-                        try:
-                            # Backspace the lowercase char that the OS likely already typed
-                            # (since we aren't globally suppressing)
-                            # Actually, most systems haven't typed it yet if we are fast.
-                            # But with pynput, it's safer to just let it go and then correction fixes it,
-                            # UNLESS we want it truly immediate.
-                            
-                            # For true immediate, we should have used a 'suppress=True' listener.
-                            # Given the current architecture, we will update the _word_buffer 
-                            # immediately and if the user types a word, the correction will 
-                            # ensure the case is preserved/updated.
-                            
-                            # TO MATCH "NOTICEABLY FASTER":
-                            # We will perform a quick Backspace + UpperChar if possible.
-                            controller.press(Key.backspace)
-                            controller.release(Key.backspace)
-                            controller.type(upper_ch)
-                        finally:
-                            with _suppress_lock:
-                                _suppress_typed_keys = False
-
-                    threading.Thread(target=_do_cap_swap, args=(ch, final_ch), daemon=True).start()
-                    _word_buffer.append(final_ch)
-                    _recent_chars.append(final_ch)
+                            _suppress_typed_keys = False
                 else:
                     _word_buffer.append(ch)
                     _recent_chars.append(ch)
