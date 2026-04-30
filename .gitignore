@@ -2,6 +2,7 @@
 stats.json
 unknown.txt
 custom_dict.txt
+config.json
 
 # Python Artifacts
 __pycache__/

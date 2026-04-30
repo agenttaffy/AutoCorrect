@@ -733,7 +733,7 @@ class AutoCorrectGUI(QMainWindow):
         m_lbl.setFont(QFont(FONT_STACK, 10))
         m_lbl.setStyleSheet(f"color: {C_TEXT_SEC.name()};")
         
-        self.btn_master = NeuralToggle(checked=True)
+        self.btn_master = NeuralToggle(checked=AutoCorrect.MASTER_ENABLE)
         self.btn_master.toggled.connect(self.on_master_toggle)
         
         m_layout.addWidget(m_lbl)
@@ -747,7 +747,7 @@ class AutoCorrectGUI(QMainWindow):
         t_lbl.setFont(QFont(FONT_STACK, 10))
         t_lbl.setStyleSheet(f"color: {C_TEXT_SEC.name()};")
         
-        self.btn_toggle = NeuralToggle(checked=True)
+        self.btn_toggle = NeuralToggle(checked=AutoCorrect.ENABLE_BIGRAMS)
         self.btn_toggle.toggled.connect(self.on_bigram_toggle)
         
         t_layout.addWidget(t_lbl)
@@ -761,7 +761,7 @@ class AutoCorrectGUI(QMainWindow):
         c_lbl.setFont(QFont(FONT_STACK, 10))
         c_lbl.setStyleSheet(f"color: {C_TEXT_SEC.name()};")
         
-        self.btn_caps = NeuralToggle(checked=True)
+        self.btn_caps = NeuralToggle(checked=AutoCorrect.ENABLE_CAPITALIZATION)
         self.btn_caps.toggled.connect(self.on_caps_toggle)
         
         c_layout.addWidget(c_lbl)
@@ -791,8 +791,28 @@ class AutoCorrectGUI(QMainWindow):
         u_layout.addWidget(u_lbl)
         u_layout.addWidget(self.undo_input)
         layout.addLayout(u_layout)
-        
+
         layout.addStretch()
+        
+        # Quit Button
+        self.btn_quit = QPushButton("EXIT DAEMON")
+        self.btn_quit.setFixedHeight(40)
+        self.btn_quit.setCursor(Qt.PointingHandCursor)
+        self.btn_quit.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgba(255, 87, 160, 40);
+                color: {C_ACCENT.name()};
+                border: 1px solid rgba(255, 87, 160, 80);
+                border-radius: 4px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(255, 87, 160, 80);
+            }}
+        """)
+        self.btn_quit.clicked.connect(self.quit_app)
+        layout.addWidget(self.btn_quit)
+
         return panel
 
     def build_stat_row(self, label, value, val_color=C_TEXT_PRI):
@@ -812,18 +832,22 @@ class AutoCorrectGUI(QMainWindow):
 
     def on_master_toggle(self, checked):
         AutoCorrect.MASTER_ENABLE = checked
+        AutoCorrect.save_config()
 
     def on_bigram_toggle(self, checked):
         AutoCorrect.ENABLE_BIGRAMS = checked
+        AutoCorrect.save_config()
 
     def on_caps_toggle(self, checked):
         AutoCorrect.ENABLE_CAPITALIZATION = checked
+        AutoCorrect.save_config()
 
     def on_undo_change(self, text):
         try:
             val = float(text)
             if 0 < val < 5:
                 AutoCorrect.UNDO_WINDOW = val
+                AutoCorrect.save_config()
         except ValueError:
             pass
 

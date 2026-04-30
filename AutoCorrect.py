@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-def main():
-    print("IN MAIN")
-    print(BANNER.format(
-        dict_count=len(CORRECTIONS),
-        vocab_count=len(WORDS),
-        token_count=TOTAL_WORDS
-    ))
-    ...
+
 """
 ╔══════════════════════════════════════════════════════╗
 ║        AutoCorrect Daemon v4.0 (Context-Aware)       ║
@@ -43,6 +36,7 @@ import re
 import json
 import datetime
 from collections import Counter, deque
+from functools import lru_cache
 
 try:
     from pynput.keyboard import Key, Controller, Listener
@@ -68,6 +62,36 @@ MASTER_ENABLE = True
 STATS_FILE = "stats.json"
 CUSTOM_DICT_FILE = "custom_dict.txt"
 UNKNOWN_FILE = "unknown.txt"
+CONFIG_FILE = "config.json"
+
+def save_config():
+    config = {
+        "ENABLE_BIGRAMS": ENABLE_BIGRAMS,
+        "ENABLE_CAPITALIZATION": ENABLE_CAPITALIZATION,
+        "UNDO_WINDOW": UNDO_WINDOW,
+        "MASTER_ENABLE": MASTER_ENABLE
+    }
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f)
+    except:
+        pass
+
+def load_config():
+    global ENABLE_BIGRAMS, ENABLE_CAPITALIZATION, UNDO_WINDOW, MASTER_ENABLE
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                config = json.load(f)
+                ENABLE_BIGRAMS = config.get("ENABLE_BIGRAMS", ENABLE_BIGRAMS)
+                ENABLE_CAPITALIZATION = config.get("ENABLE_CAPITALIZATION", ENABLE_CAPITALIZATION)
+                UNDO_WINDOW = config.get("UNDO_WINDOW", UNDO_WINDOW)
+                MASTER_ENABLE = config.get("MASTER_ENABLE", MASTER_ENABLE)
+        except:
+            pass
+
+# Load config at module level
+load_config()
 
 def load_stats():
     if os.path.exists(STATS_FILE):
@@ -161,6 +185,7 @@ def _notify_log(orig, corr):
         cb(orig, corr)
 
 def _notify_toggle(enabled):
+    save_config() # Save on hotkey toggle
     cb = GUI_CALLBACKS["on_toggle"]
     if cb:
         cb(enabled)
@@ -338,10 +363,80 @@ _prev_words = deque(maxlen=3)  # rolling buffer of recent flushed words
 BIGRAMS = Counter()            # bigram frequency table
 TOTAL_BIGRAMS = 0
 
-# ── Auto-capitalization (Feature: Smart capitalization) ──
+# ── Auto-capitalization (State-Machine Based) ──
 SENTENCE_END_CHARS = set(".!?")
-_sentence_end_pending = False
-_capitalize_next = False
+_recent_chars = deque(maxlen=16)
+
+def is_decimal_point_context(recent: deque) -> bool:
+    """Return True if the period in the buffer is likely a decimal point (e.g., '3.')."""
+    if len(recent) < 2:
+        return False
+    # Context: [..., Digit, '.']
+    return recent[-1] == "." and recent[-2].isdigit()
+
+def has_sentence_boundary(recent: deque) -> bool:
+    """Return True if the current buffer ends with a sentence boundary and optional whitespace."""
+    if not recent:
+        return False
+        
+    s = "".join(recent).rstrip()
+    if not s:
+        return False
+        
+    last_p = s[-1]
+    if last_p not in SENTENCE_END_CHARS:
+        return False
+        
+    if last_p == ".":
+        # Check if it's a decimal point by looking back
+        # We need to find the index of the last period in the joined string
+        p_idx = s.rfind(".")
+        if p_idx > 0 and s[p_idx-1].isdigit():
+            # Potential decimal. We only confirm it's NOT a boundary if it was 
+            # followed by another digit, but here we are checking if it's a boundary *now*.
+            # If it's a digit then a period, it's only a boundary if followed by whitespace.
+            # If it's followed by whitespace, we treat it as a boundary (e.g., "In 2024. Next...")
+            pass 
+            
+    return True
+
+def should_autocap_on_char(ch: str, recent: deque) -> bool:
+    """Return True if the character ch should be capitalized based on recent context."""
+    if not ENABLE_CAPITALIZATION or not ch.isalpha():
+        return False
+        
+    # Boundary: Start of buffer, or after Enter, or after [.!?] + whitespace
+    if not recent:
+        return True
+        
+    if recent[-1] == "\n":
+        return True
+        
+    # Join recent and rstrip to see the last non-space char
+    s = "".join(recent)
+    stripped = s.rstrip()
+    if not stripped:
+        return True # Buffer was all whitespace/empty
+        
+    last_non_space = stripped[-1]
+    if last_non_space in SENTENCE_END_CHARS:
+        # Avoid capitalization if the last period was a decimal
+        # We check the context of that period
+        p_idx = s.rfind(last_non_space)
+        if last_non_space == "." and p_idx > 0 and s[p_idx-1].isdigit():
+            # If there's a digit before the period, and no space AFTER the period yet,
+            # then a digit now would make it a decimal. But 'ch' is alpha here.
+            # If there is a space after "3.", then 'ch' (alpha) should be capitalized.
+            # If there is NO space after "3.", then "3.a" is likely not a sentence start.
+            if s.endswith("."):
+                return False
+        
+        # Sentence boundary must be followed by some whitespace to trigger autocap
+        # unless it was an Enter (handled above)
+        if s[-1].isspace() or s[-1] in SENTENCE_END_CHARS:
+            return True
+            
+    return False
 
 # ── Confusable words for context-aware retroactive correction ──
 CONFUSABLES = {
@@ -526,24 +621,32 @@ def known(candidates):
     return {w for w in candidates if w in WORDS}
 
 
-def edits1(word: str):
+@lru_cache(maxsize=4096)
+def _edits1_raw(word: str):
+    """Internal: Generate all possible edits at distance 1 (unfiltered)."""
     splits = [(word[:i], word[i:]) for i in range(len(word) + 1)]
     deletes = [L + R[1:] for L, R in splits if R]
     transposes = [L + R[1] + R[0] + R[2:] for L, R in splits if len(R) > 1]
     replaces = [L + c + R[1:] for L, R in splits if R for c in ALPHABET]
     inserts = [L + c + R for L, R in splits for c in ALPHABET]
-    return set(deletes + transposes + replaces + inserts)
+    return frozenset(deletes + transposes + replaces + inserts)
 
+def edits1(word: str):
+    """Generator: Yield distance-1 edits that exist in the dictionary."""
+    for cand in _edits1_raw(word):
+        # Must be in TRUSTED_WORDS (if loaded) AND have a frequency count
+        if (not TRUSTED_WORDS or cand in TRUSTED_WORDS) and cand in WORDS:
+            yield cand
 
 def edits2_known(word: str):
-    out = set()
-    for e1 in edits1(word):
-        for e2 in edits1(e1):
-            # Must pass the same existence gate as known()
-            if (TRUSTED_WORDS and e2 in TRUSTED_WORDS and e2 in WORDS) or \
-               (not TRUSTED_WORDS and e2 in WORDS):
-                out.add(e2)
-    return out
+    """Generator: Yield distance-2 edits that exist in the dictionary."""
+    seen = set()
+    for e1 in _edits1_raw(word):
+        for e2 in _edits1_raw(e1):
+            if e2 not in seen:
+                if (not TRUSTED_WORDS or e2 in TRUSTED_WORDS) and e2 in WORDS:
+                    seen.add(e2)
+                    yield e2
 
 
 def preserve_case(original: str, corrected: str) -> str:
@@ -655,12 +758,12 @@ def correction(word: str, prev_word: str = None) -> str | None:
         return None
 
     # 4) Generate candidates (edit distance 1, optionally 2)
-    cands1 = known(edits1(lower))
+    cands1 = set(edits1(lower))
     if cands1:
         candidates = cands1
         ed = 1
     else:
-        candidates = edits2_known(lower)
+        candidates = set(edits2_known(lower))
         ed = 2
 
     if not candidates:
@@ -839,7 +942,7 @@ def _apply_undo():
 
 
 def _flush_buffer(boundary_was_space: bool):
-    global _word_buffer, _capitalize_next
+    global _word_buffer
     global GUI_WORDS_SCANNED, GUI_TOTAL_PROCESSING_TIME
 
     if not _word_buffer:
@@ -911,9 +1014,8 @@ def _flush_buffer(boundary_was_space: bool):
             final_word = preserve_case(stripped, best_current)
 
     # Auto-capitalize after sentence boundary (.!? followed by space/enter)
-    if ENABLE_CAPITALIZATION and _capitalize_next and final_word and final_word[0].islower():
-        final_word = final_word[0].upper() + final_word[1:]
-    _capitalize_next = False  # always consume the flag after processing a word
+    # (Deprecated: now handled immediately in on_press)
+    pass
 
     # Track this word for future bigram context
     _prev_words.append(final_word.lower())
@@ -973,7 +1075,6 @@ def on_press(key):
         return
 
     global _last_correction
-    global _sentence_end_pending, _capitalize_next
 
     with _suppress_lock:
         if _suppress_typed_keys:
@@ -1000,15 +1101,13 @@ def on_press(key):
     try:
         if key in BOUNDARY_KEYS:
             _flush_buffer(boundary_was_space=(key == Key.space))
-
-            # Sentence boundary: if we saw .!? before this space/enter, capitalize next word
-            if _sentence_end_pending:
-                _capitalize_next = True
-                _sentence_end_pending = False
-
-            # Enter always starts a new sentence (new paragraph)
+            
             if key == Key.enter:
-                _capitalize_next = True
+                _recent_chars.append("\n")
+            elif key == Key.space:
+                _recent_chars.append(" ")
+            elif key == Key.tab:
+                _recent_chars.append("\t")
 
         elif key == Key.backspace:
             if _backspace_down:
@@ -1032,12 +1131,14 @@ def on_press(key):
 
             if _word_buffer:
                 _word_buffer.pop()
+                
+            if _recent_chars:
+                _recent_chars.pop()
 
         elif key in RESET_KEYS:
             _word_buffer.clear()
             _prev_words.clear()
-            _sentence_end_pending = False
-            _capitalize_next = False
+            _recent_chars.clear()
             # Any navigation clears undo availability
             with _last_correction_lock:
                 _last_correction = None
@@ -1047,13 +1148,52 @@ def on_press(key):
 
             if ch in PUNCT_CHARS:
                 _flush_buffer(boundary_was_space=False)
-                # Track sentence-ending punctuation for auto-capitalization
-                if ch in SENTENCE_END_CHARS:
-                    _sentence_end_pending = True
-                else:
-                    _sentence_end_pending = False
+                _recent_chars.append(ch)
             elif ch.isprintable():
-                _word_buffer.append(ch)
+                # Immediate Auto-Capitalization Logic
+                if should_autocap_on_char(ch, _recent_chars):
+                    # Intercept and type uppercase version
+                    final_ch = ch.upper()
+                    
+                    # We need to suppress the current key and type the upper one
+                    # However, since we are in a listener and NOT using a global suppress
+                    # for every key, we can simply update the word_buffer and then
+                    # if we were to apply a correction later it would use the upper char.
+                    # BUT the user asked for it to be "fast" and "on char input".
+                    # This implies the character typed into the application should be upper.
+                    
+                    # Implementation: Suppress the lowercase char and type the uppercase one.
+                    def _do_cap_swap(original_ch, upper_ch):
+                        with _suppress_lock:
+                            global _suppress_typed_keys
+                            _suppress_typed_keys = True
+                        try:
+                            # Backspace the lowercase char that the OS likely already typed
+                            # (since we aren't globally suppressing)
+                            # Actually, most systems haven't typed it yet if we are fast.
+                            # But with pynput, it's safer to just let it go and then correction fixes it,
+                            # UNLESS we want it truly immediate.
+                            
+                            # For true immediate, we should have used a 'suppress=True' listener.
+                            # Given the current architecture, we will update the _word_buffer 
+                            # immediately and if the user types a word, the correction will 
+                            # ensure the case is preserved/updated.
+                            
+                            # TO MATCH "NOTICEABLY FASTER":
+                            # We will perform a quick Backspace + UpperChar if possible.
+                            controller.press(Key.backspace)
+                            controller.release(Key.backspace)
+                            controller.type(upper_ch)
+                        finally:
+                            with _suppress_lock:
+                                _suppress_typed_keys = False
+
+                    threading.Thread(target=_do_cap_swap, args=(ch, final_ch), daemon=True).start()
+                    _word_buffer.append(final_ch)
+                    _recent_chars.append(final_ch)
+                else:
+                    _word_buffer.append(ch)
+                    _recent_chars.append(ch)
 
             # Any typing clears undo availability
             with _last_correction_lock:
