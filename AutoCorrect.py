@@ -63,7 +63,7 @@ STATS_FILE = "stats.json"
 CUSTOM_DICT_FILE = "custom_dict.txt"
 UNKNOWN_FILE = "unknown.txt"
 CONFIG_FILE = "config.json"
-global _suppress_typed_keys
+
 def save_config():
     config = {
         "ENABLE_BIGRAMS": ENABLE_BIGRAMS,
@@ -121,13 +121,14 @@ def log_unknown(word):
         f.write(word + "\n")
 
 def load_custom_dict():
+    words = []
     if os.path.exists(CUSTOM_DICT_FILE):
         with open(CUSTOM_DICT_FILE, "r") as f:
             for line in f:
                 w = line.strip().lower()
                 if w:
-                    TRUSTED_WORDS.add(w)
-                    WORDS[w] += 1000  # High frequency to ensure it gets picked
+                    words.append(w)
+    return words
 
 def add_custom_word(word):
     w = word.strip().lower()
@@ -135,6 +136,7 @@ def add_custom_word(word):
     
     # Add to memory
     TRUSTED_WORDS.add(w)
+    VOCAB_TRIE.insert(w)
     WORDS[w] += 1000
     
     # Save to file
@@ -363,6 +365,59 @@ _prev_words = deque(maxlen=3)  # rolling buffer of recent flushed words
 BIGRAMS = Counter()            # bigram frequency table
 TOTAL_BIGRAMS = 0
 
+# ── Trie Structure (Feature: Optimized Lookups) ──
+class TrieNode:
+    def __init__(self):
+        self.children = {}
+        self.is_end = False
+
+class Trie:
+    def __init__(self):
+        self.root = TrieNode()
+
+    def insert(self, word: str):
+        node = self.root
+        for char in word:
+            if char not in node.children:
+                node.children[char] = TrieNode()
+            node = node.children[char]
+        node.is_end = True
+
+    def search(self, word: str) -> bool:
+        node = self.root
+        for char in word:
+            if char not in node.children:
+                return False
+            node = node.children[char]
+        return node.is_end
+
+    @lru_cache(maxsize=4096)
+    def get_candidates(self, word: str, max_dist: int) -> frozenset:
+        results = set()
+        rows = range(len(word) + 1)
+        for char, child in self.root.children.items():
+            self._fuzzy_recursive(child, char, word, rows, results, max_dist)
+        return frozenset(results)
+
+    def _fuzzy_recursive(self, node, prefix, target, prev_rows, results, max_dist):
+        columns = len(target) + 1
+        current_rows = [prev_rows[0] + 1]
+
+        for col in range(1, columns):
+            insert = current_rows[col - 1] + 1
+            delete = prev_rows[col] + 1
+            replace = prev_rows[col - 1] + (0 if target[col - 1] == prefix[-1] else 1)
+            current_rows.append(min(insert, delete, replace))
+
+        if current_rows[-1] <= max_dist and node.is_end:
+            results.add(prefix)
+
+        if min(current_rows) <= max_dist:
+            for char, child in node.children.items():
+                self._fuzzy_recursive(child, prefix + char, target, current_rows, results, max_dist)
+
+VOCAB_TRIE = Trie()
+
 # ── Auto-capitalization (State-Machine Based) ──
 SENTENCE_END_CHARS = set(".!?")
 _recent_chars = deque(maxlen=16)
@@ -374,31 +429,7 @@ def is_decimal_point_context(recent: deque) -> bool:
     # Context: [..., Digit, '.']
     return recent[-1] == "." and recent[-2].isdigit()
 
-def has_sentence_boundary(recent: deque) -> bool:
-    """Return True if the current buffer ends with a sentence boundary and optional whitespace."""
-    if not recent:
-        return False
-        
-    s = "".join(recent).rstrip()
-    if not s:
-        return False
-        
-    last_p = s[-1]
-    if last_p not in SENTENCE_END_CHARS:
-        return False
-        
-    if last_p == ".":
-        # Check if it's a decimal point by looking back
-        # We need to find the index of the last period in the joined string
-        p_idx = s.rfind(".")
-        if p_idx > 0 and s[p_idx-1].isdigit():
-            # Potential decimal. We only confirm it's NOT a boundary if it was 
-            # followed by another digit, but here we are checking if it's a boundary *now*.
-            # If it's a digit then a period, it's only a boundary if followed by whitespace.
-            # If it's followed by whitespace, we treat it as a boundary (e.g., "In 2024. Next...")
-            pass 
-            
-    return True
+    return recent[-1] == "." and recent[-2].isdigit()
 
 def should_autocap_on_char(ch: str, recent: deque) -> bool:
     """Return True if the character ch should be capitalized based on recent context."""
@@ -474,6 +505,8 @@ def add_words_from_iterable(words_iterable, weight=1):
         w = w.strip().lower()
         if 2 <= len(w) <= 30 and re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w):
             WORDS[w] += weight
+            VOCAB_TRIE.insert(w)
+            TRUSTED_WORDS.add(w)
 
 
 def build_vocabulary():
@@ -492,9 +525,8 @@ def build_vocabulary():
                     w = line.strip().lower()
                     if 2 <= len(w) <= 30 and re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w):
                         TRUSTED_WORDS.add(w)
-            # Attempt to load custom dict
-            load_custom_dict()
-
+                        VOCAB_TRIE.insert(w)
+            
             print(f"[INFO] Loaded trusted word list: {trusted_path} ({len(TRUSTED_WORDS):,} words)")
         except Exception as e:
             print(f"[WARN] Could not load TRUSTED_WORDS.txt: {e}")
@@ -506,11 +538,13 @@ def build_vocabulary():
         w = w.strip().lower()
         if w:
             TRUSTED_WORDS.add(w)
+            VOCAB_TRIE.insert(w)
     for v in CORRECTIONS.values():
         v = v.strip().lower()
         # multi-word corrections (e.g. "a lot") — trust each token
         for tok in v.split():
             TRUSTED_WORDS.add(tok)
+            VOCAB_TRIE.insert(tok)
 
     # ── 2. WORDS (frequency table): used only for ranking candidates ──────────
     # Seed with BASE_WORDS and correction targets at high weight.
@@ -532,6 +566,8 @@ def build_vocabulary():
                     # Weight decays from ~200 (rank 0) down to ~1 (rank total-1)
                     weight = max(1, int(200 * (1 - rank / total)))
                     WORDS[w] += weight
+                    VOCAB_TRIE.insert(w)
+                    TRUSTED_WORDS.add(w)
             print(f"[INFO] Loaded frequency list: {extra_wordlist} ({len(lines):,} entries)")
         except Exception as e:
             print(f"[WARN] Could not load wordlist.txt: {e}")
@@ -548,6 +584,13 @@ def build_vocabulary():
             print(f"[INFO] Loaded corpus frequencies: {corpus_path}")
         except Exception as e:
             print(f"[WARN] Could not load corpus.txt: {e}")
+    
+    # Custom dict
+    custom = load_custom_dict()
+    for word in custom:
+        WORDS[word] += 1
+        VOCAB_TRIE.insert(word)
+        TRUSTED_WORDS.add(word)
 
     for path in SYSTEM_DICT_PATHS:
         if os.path.isfile(path) and os.path.getsize(path) < 10_000_000:
@@ -559,7 +602,7 @@ def build_vocabulary():
             except Exception:
                 pass
 
-    TOTAL_WORDS = sum(WORDS.values())
+    TOTAL_WORDS = sum(WORDS.values()) or 1000
 
     # ── 3. BIGRAMS: context-aware ranking ──────────────────────────────
     bigrams_path = os.path.join(base_dir, "Bigram.txt")
@@ -621,32 +664,14 @@ def known(candidates):
     return {w for w in candidates if w in WORDS}
 
 
-@lru_cache(maxsize=4096)
-def _edits1_raw(word: str):
-    """Internal: Generate all possible edits at distance 1 (unfiltered)."""
-    splits = [(word[:i], word[i:]) for i in range(len(word) + 1)]
-    deletes = [L + R[1:] for L, R in splits if R]
-    transposes = [L + R[1] + R[0] + R[2:] for L, R in splits if len(R) > 1]
-    replaces = [L + c + R[1:] for L, R in splits if R for c in ALPHABET]
-    inserts = [L + c + R for L, R in splits for c in ALPHABET]
-    return frozenset(deletes + transposes + replaces + inserts)
-
 def edits1(word: str):
-    """Generator: Yield distance-1 edits that exist in the dictionary."""
-    for cand in _edits1_raw(word):
-        # Must be in TRUSTED_WORDS (if loaded) AND have a frequency count
-        if (not TRUSTED_WORDS or cand in TRUSTED_WORDS) and cand in WORDS:
-            yield cand
+    """Return distance-1 edits using Trie fuzzy search."""
+    # We return a set for compatibility with existing logic
+    return VOCAB_TRIE.get_candidates(word, 1)
 
 def edits2_known(word: str):
-    """Generator: Yield distance-2 edits that exist in the dictionary."""
-    seen = set()
-    for e1 in _edits1_raw(word):
-        for e2 in _edits1_raw(e1):
-            if e2 not in seen:
-                if (not TRUSTED_WORDS or e2 in TRUSTED_WORDS) and e2 in WORDS:
-                    seen.add(e2)
-                    yield e2
+    """Return distance-2 edits using Trie fuzzy search."""
+    return VOCAB_TRIE.get_candidates(word, 2)
 
 
 def preserve_case(original: str, corrected: str) -> str:
@@ -689,50 +714,7 @@ def looks_like_simple_inflection(original: str, candidate: str) -> bool:
     return False
 
 
-def edit_distance_bucket(original: str, candidate: str) -> int:
-    if candidate in known(edits1(original)):
-        return 1
-    return 2
-
-
-def candidate_score(original: str, candidate: str):
-    dist = edit_distance_bucket(original, candidate)
-    same_first = 1 if candidate and original and candidate[0] == original[0] else 0
-    same_last = 1 if candidate and original and candidate[-1] == original[-1] else 0
-
-    # Lower distance is better.
-    # Frequency only matters after distance.
-    return (
-        -dist,
-        same_first + same_last,
-        P(candidate),
-        -abs(len(candidate) - len(original)),
-    )
-
-
-def choose_best_candidate(original: str, candidates):
-    filtered = []
-
-    for cand in candidates:
-        if cand == original:
-            continue
-
-        if looks_like_simple_inflection(original, cand):
-            continue
-
-        if abs(len(cand) - len(original)) > 2:
-            continue
-
-        filtered.append(cand)
-
-    if not filtered:
-        return None
-
-    filtered.sort(key=lambda c: candidate_score(original, c), reverse=True)
-
-    best = filtered[0]
-    second = filtered[1] if len(filtered) > 1 else None
-    return best, second
+    return False
 
 
 def correction(word: str, prev_word: str = None) -> str | None:
@@ -762,8 +744,12 @@ def correction(word: str, prev_word: str = None) -> str | None:
     if cands1:
         candidates = cands1
         ed = 1
-    else:
+    elif len(lower) >= 6:
+        # Distance-2 only for words 6+ chars to avoid noise/lag
         candidates = set(edits2_known(lower))
+        ed = 2
+    else:
+        candidates = set()
         ed = 2
 
     if not candidates:
@@ -1040,15 +1026,14 @@ def _flush_buffer(boundary_was_space: bool):
 # KEYBOARD EVENTS
 # ─────────────────────────────────────────────────────
 def is_valid(word: str) -> bool:
-    """Return True if the word should be left alone (it's a real, known word)."""
-    if TRUSTED_WORDS:
-        return word in TRUSTED_WORDS
-    # Fallback if TRUSTED_WORDS.txt wasn't loaded
-    return word in WORDS
-def on_press(key):
+    """Return True if the word exists in our vocabulary (set-based lookup for speed)."""
+    return word in TRUSTED_WORDS or word in WORDS
+def on_press(key, injected=False):
+    if injected:
+        return
     global _CTRL_DOWN, _SHIFT_DOWN, _backspace_down
-    global _capitalize_next, _last_backspace_time
-    global MASTER_ENABLE
+    global _last_backspace_time
+    global MASTER_ENABLE, _suppress_typed_keys
 
     with _suppress_lock:
         if _suppress_typed_keys:
@@ -1084,19 +1069,6 @@ def on_press(key):
         _CTRL_DOWN = True
     if key in (Key.shift, Key.shift_l, Key.shift_r):
         _SHIFT_DOWN = True
-
-    try:
-        if _CTRL_DOWN and _SHIFT_DOWN and hasattr(key, "char") and key.char in ("a", "A"):
-            with _enabled_lock:
-                _enabled = not _enabled
-            status = "\033[92mENABLED\033[0m" if _enabled else "\033[91mDISABLED\033[0m"
-            print(f"\n  ── AutoCorrect {status} ──\n")
-            _word_buffer.clear()
-            return
-    except Exception:
-        pass
-
-
 
     try:
         if key in BOUNDARY_KEYS:
@@ -1159,7 +1131,6 @@ def on_press(key):
                     
                     # 2. Synchronous replacement (faster & more predictable than threading)
                     with _suppress_lock:
-                        
                         _suppress_typed_keys = True
                     try:
                         # Tap backspace to remove the lowercase char that just hit the OS
@@ -1182,7 +1153,9 @@ def on_press(key):
         pass
 
 
-def on_release(key):
+def on_release(key, injected=False):
+    if injected:
+        return
     global _CTRL_DOWN, _SHIFT_DOWN, _backspace_down
 
     if key in (Key.ctrl, Key.ctrl_l, Key.ctrl_r):
